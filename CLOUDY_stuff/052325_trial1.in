@@ -1,0 +1,16 @@
+title 052325_trial1
+Ionization parameter -2
+table SED "fsps_iso.ascii"
+hden 3
+cmb
+iterate to convergence
+stop temperature 2 K
+stop neutral column density [0.1% of total H column]
+set temperature floor 2.73
+set nchrg 2
+normalize to "H  1" 18756.21 angstroms
+no level 2 lines
+abundances ism
+save lines, array "hydrogen_lines.dat" "H 1"
+grains ISM abundance scaling 1.5
+save lines, array "052325_trial1.dat" "H  1" no extinction
