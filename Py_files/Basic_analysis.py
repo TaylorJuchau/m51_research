@@ -8,6 +8,14 @@ import pandas as pd
 import re
 import requests
 from bs4 import BeautifulSoup
+import astropy.units as u
+from astropy.wcs import WCS
+from astropy.constants import c
+from astropy.io import fits
+from astropy.visualization import simple_norm, imshow_norm
+from photutils.aperture import CircularAperture, aperture_photometry
+from spectral_cube import SpectralCube
+from astropy.coordinates import SkyCoord
 
 def try_float(x):
     '''Try to convert item to float, if that fails, leave it as the type that it is, likely a string
@@ -202,3 +210,81 @@ def get_feature_statistics(rest_wl_array, transitions):
         z_temp.append(((obs-rest)/rest))
     z = np.nanmedian(z_temp)
     return fluxes, center_wl, velocities, z
+
+
+def get_IFU_spectrum(IFU_filepath, loc, radius, replace_negatives = 1e-3):
+    '''extract spectrum from IFU file with aperature of radius, centered at ra,dec = loc
+    -------------
+    
+    Parameters
+    -------------
+    IFU_filepath : type = str - string to location of IFU fits file
+    loc : type = list - ra, dec in degrees or SkyCoord object
+    radius : type = float - radius of aperture, must have units attached (like u.deg or u.arcsecond)
+    replace_negatives (optional, defaults to 1/1000th) : type = float : replace negative fluxes with this float times the smallest positive flux value, specify             as None to leave as negative values
+    Returns
+    -------------
+    structured array with entries for "wavelength" and "intensity"
+    '''   
+    #fake_missing_header_info(IFU_filepath) #TJ run this if needed
+    hdul = fits.open(IFU_filepath)
+    header = hdul['SCI'].header
+    wcs = WCS(header)
+    cube = SpectralCube.read(IFU_filepath, hdu='SCI')
+
+    # === CONVERT RA/DEC TO PIXEL COORDINATES ===
+    # Create SkyCoord object for spatial coordinates
+    if type(loc) == list:
+        spatial_coords = SkyCoord(ra=loc[0]*u.deg, dec=loc[1]*u.deg)
+    elif type(loc) == SkyCoord:
+        spatial_coords = loc
+    else:
+        print('loc is not a list of ra, dec and it is not a SkyCoord object.')
+        return None
+    
+    # Convert spatial coordinates to pixels
+    x, y = wcs.celestial.all_world2pix(spatial_coords.ra.deg, 
+                                      spatial_coords.dec.deg, 0)
+    
+    # === BUILD APERTURE ===
+    if header['CDELT2'] != header['CDELT1']:
+        print('pixels are not square! function revisit get_IFU_spectrum() function to fix')
+        return None
+    cdelt = np.abs(header['CDELT2']) * u.deg
+    pixel_scale = cdelt.to(u.arcsec)  # arcsec/pixel
+    pix_area = header['PIXAR_SR'] #TJ pixel area in steradians
+    radius = radius.to(u.arcsec)
+    radius_pix = (radius / pixel_scale).value
+    aperture = CircularAperture((x, y), r=radius_pix)
+    aperture_area_sr = np.pi * (radius.to(u.rad))**2
+
+    # === CRITICAL UNIT HANDLING ===
+    cube = cube.with_spectral_unit(u.m)  # Ensure wavelength in meters
+    
+    # Convert flux units properly
+    # Step 1: MJy/sr → W/m²/Hz/sr
+    cube = cube.to(u.W/(u.m**2 * u.Hz * u.sr))  
+    
+    # Step 2: Multiply by pixel area to get W/m²/Hz/pixel
+    pix_area_sr = header['PIXAR_SR'] * u.sr
+    cube = cube * pix_area_sr
+    
+    # Step 3: Perform aperture sum (now in W/m²/Hz)
+    flux_density_spectrum = []
+    for i in range(len(cube.spectral_axis)):
+        image_slice = cube[i].value  # Now in W/m²/Hz
+        phot = aperture_photometry(image_slice, aperture)
+        flux_density_spectrum.append(phot['aperture_sum'][0])  #TJ No extra multiplication! already in correct units
+    wavelengths = cube.spectral_axis.to(u.m).value
+    flux_density_spectrum = np.array(flux_density_spectrum)
+    if replace_negatives:
+        min_positive = min(flux_density_spectrum[flux_density_spectrum > 0])
+        flux_density_spectrum[flux_density_spectrum < 0] = replace_negatives*min_positive  #TJ replace negative numbers with a very small positive value
+
+
+    dtype = [('wavelength', 'f8'), ('intensity', 'f8')]
+    spectrum = np.zeros(len(cube.spectral_axis), dtype=dtype)
+    spectrum['wavelength'] = cube.spectral_axis.to(u.m).value
+    spectrum['intensity'] = np.array(flux_density_spectrum)
+
+    return spectrum
